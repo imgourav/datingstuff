@@ -1,5 +1,6 @@
 from datetime import datetime
 import re
+import math, random
 from flask import Flask, jsonify, request, session,send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, join_room, send, emit
@@ -10,7 +11,13 @@ from sqlalchemy import or_, and_
 from flask import request, jsonify
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = "postgresql://wingsdatingapp107_render_example_user:k2tv22tHt4FhEGm4iGFLPgn655BoayOF@dpg-d1ifa3ali9vc73fvstqg-a.frankfurt-postgres.render.com/wingsdatingapp107_render_example"
+app.config['SQLALCHEMY_DATABASE_URI'] = "postgresql://postgres:1234@localhost:5432/dating_app"
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+}
+
 socketio = SocketIO(app)
 db = SQLAlchemy(app)
 
@@ -35,6 +42,8 @@ class Task(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     email = db.Column(db.String(200), unique=True,nullable=False)
     password = db.Column(db.String, nullable=False)
+    lat = db.Column(db.Float, nullable=True)
+    lng = db.Column(db.Float, nullable=True)
 
 
 class Message(db.Model):
@@ -247,18 +256,123 @@ def get_users_in_location(center_lat, center_lng, radius):
 def shuffle_matches(center_lat, center_lng, radius, max_users):
     """
     Shuffle matches for users within a specified location.
+    Creates MUTUAL matches (user1 ↔ user2) instead of one-way matches.
+    Handles odd numbers with fair rotation - different user left out each time.
     """
     users = get_users_in_location(center_lat, center_lng, radius)
     if len(users) > max_users:
         users = users[:max_users]
-    # Shuffle users
-    random.shuffle(users)
-    # Create matches
-    for i in range(0, len(users), 2):
-        if i + 1 < len(users):
-            user1 = users[i]
-            user2 = users[i + 1]
-            process_potential_match(user1.id, user2.id)
+    
+    # Separate users by gender for proper matching
+    male_users = []
+    female_users = []
+    
+    for user in users:
+        user_data = UserData.query.filter_by(user_auth_id=user.id).first()
+        if user_data:
+            gender = user_data.gender.lower() if user_data.gender else ""
+            if gender in ['men', 'man', 'male']:
+                male_users.append(user)
+            elif gender in ['women', 'woman', 'female']:
+                female_users.append(user)
+    
+    print(f"Total users: {len(users)}, Male: {len(male_users)}, Female: {len(female_users)}")
+    
+    # Handle odd numbers with fair rotation
+    if len(male_users) != len(female_users):
+        # Get the last matchmaking session to determine who was left out
+        last_matchmaking = Match.query.order_by(Match.match_date.desc()).first()
+        
+        # Determine which gender has more users
+        if len(male_users) > len(female_users):
+            # More males, need to rotate which male gets left out
+            excess_users = male_users
+            base_users = female_users
+            excess_gender = "male"
+        else:
+            # More females, need to rotate which female gets left out
+            excess_users = female_users
+            base_users = male_users
+            excess_gender = "female"
+        
+        # Implement fair rotation
+        if last_matchmaking:
+            # Check who was left out in the last session
+            last_match_date = last_matchmaking.match_date
+            recent_matches = Match.query.filter(
+                Match.match_date >= last_match_date - timedelta(hours=1)
+            ).all()
+            
+            # Get users who were matched recently
+            recently_matched = set()
+            for match in recent_matches:
+                recently_matched.add(match.user1_id)
+                recently_matched.add(match.user2_id)
+            
+            # Find users who were NOT matched recently (potential candidates to leave out)
+            unmatched_candidates = [user for user in excess_users if user.id not in recently_matched]
+            
+            if unmatched_candidates:
+                # Leave out a different user this time
+                user_to_leave_out = random.choice(unmatched_candidates)
+                excess_users.remove(user_to_leave_out)
+                print(f"Fair rotation: Leaving out {excess_gender} user {user_to_leave_out.id} this time")
+            else:
+                # If no recent matches, just leave out a random user
+                user_to_leave_out = random.choice(excess_users)
+                excess_users.remove(user_to_leave_out)
+                print(f"Random rotation: Leaving out {excess_gender} user {user_to_leave_out.id}")
+        else:
+            # First time matchmaking, leave out a random user
+            user_to_leave_out = random.choice(excess_users)
+            excess_users.remove(user_to_leave_out)
+            print(f"First time: Leaving out {excess_gender} user {user_to_leave_out.id}")
+        
+        # Now we have equal numbers
+        male_users = male_users if excess_gender == "female" else base_users
+        female_users = female_users if excess_gender == "male" else base_users
+    
+    # Shuffle both lists for random matching
+    random.shuffle(male_users)
+    random.shuffle(female_users)
+    
+    # Create mutual matches between opposite genders
+    matches_created = 0
+    for i in range(len(male_users)):  # Now both lists have same length
+        male_user = male_users[i]
+        female_user = female_users[i]
+        
+        # Check if this match already exists
+        existing_match = Match.query.filter(
+            or_(
+                and_(Match.user1_id == male_user.id, Match.user2_id == female_user.id),
+                and_(Match.user1_id == female_user.id, Match.user2_id == male_user.id)
+            )
+        ).first()
+        
+        if not existing_match:
+            # Create mutual match
+            new_match = Match(
+                user1_id=male_user.id,
+                user2_id=female_user.id,
+                status='active',
+                visible_after=datetime.utcnow() + timedelta(minutes=20)
+            )
+            db.session.add(new_match)
+            matches_created += 1
+            print(f"Created mutual match: User {male_user.id} ↔ User {female_user.id}")
+    
+    db.session.commit()
+    print(f"Matchmaking completed: {matches_created} matches created")
+    
+    # Return summary for debugging
+    return {
+        'total_users': len(users),
+        'male_users': len(male_users),
+        'female_users': len(female_users),
+        'matches_created': matches_created,
+        'users_left_out': len(users) - (matches_created * 2)
+    }
 
 
 @app.route('/matches/<email>', methods=['GET'])
@@ -287,7 +401,7 @@ def get_user_matches(email):
             if not other_user or not other_user_data:
                 continue
             # Check if the other user is within the specified location
-            location = LocationData.query.filter_by(id=other_user_data.location_id).first()
+            location = LocationInfo.query.filter_by(id=other_user_data.location_id).first()
             if not location or not is_within_location(other_user.lat, other_user.lng, location.lat, location.lng, location.radius):
                 continue
             # Get user preferences
@@ -1122,6 +1236,36 @@ def getLocationInfo():
     ]
     return jsonify(data)
 
+@app.route('/locationInfo', methods=['POST'])
+def createLocationInfo():
+    try:
+        data = request.get_json()
+        
+        new_location = LocationInfo(
+            maxAttendees=data.get('maxAttendees'),
+            maleAttendees=data.get('maleAttendees', 0),
+            femaleAttendees=data.get('femaleAttendees', 0),
+            date=data.get('date'),
+            time=data.get('time'),
+            location=data.get('location'),
+            lat=data.get('lat'),
+            lng=data.get('lng'),
+            totalPrice=data.get('totalPrice'),
+            event_type=data.get('event_type')
+        )
+        
+        db.session.add(new_location)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Location created successfully',
+            'location_id': new_location.id
+        }), 201
+        
+    except Exception as e:
+        print(f"Error creating location: {str(e)}")
+        return jsonify({'error': 'Internal Server Error'}), 500
+
 
 @app.route('/my_tickets', methods=['GET'])
 def get_user_tickets():
@@ -1180,16 +1324,44 @@ def checkin():
     if existing_checkin:
         return jsonify({'message': 'User already checked in'}), 400
 
+    # ✅ FIX 1: Slot Limit Enforcement
+    checkin_count = CheckIn.query.filter_by(location_id=location_id).count()
+    if checkin_count >= location.maxAttendees:
+        return jsonify({'message': f'All {location.maxAttendees} slots are filled'}), 400
+
+    # ✅ FIX 2: Time-Based Restrictions (10 minutes after event time)
+    try:
+        event_time = datetime.strptime(f"{location.date} {location.time}", "%Y-%m-%d %H:%M")
+        print(event_time)
+        current_time = datetime.now()
+        print(current_time)
+        time_diff = (current_time - event_time).total_seconds()
+        print(time_diff)
+        if time_diff > 600:
+            # ✅ FIX: Trigger matchmaking when time expires (even if slots aren't full) --> POINT 2
+            trigger_matchmaking_for_location(location_id)
+            return jsonify({'message': 'Check-in period has ended (10 minutes after event time)'}), 400
+    except Exception as e:
+        print(f"Error parsing event time: {str(e)}")
+        # If time parsing fails, allow check-in (graceful degradation)
+
     # Create check-in
     new_checkin = CheckIn(user_id=user_id, location_id=location_id)
     db.session.add(new_checkin)
     db.session.commit()
 
+    # ✅ FIX 3: Check if this check-in completes the slots or triggers end phase
+    updated_checkin_count = CheckIn.query.filter_by(location_id=location_id).count()
+    if updated_checkin_count >= location.maxAttendees:
+        # All slots filled - trigger automatic matchmaking
+        trigger_matchmaking_for_location(location_id)
+
     return jsonify({
         'message': 'Check-in successful',
         'user_id': user_id,
         'location_id': location_id,
-        'timestamp': new_checkin.timestamp.isoformat()
+        'timestamp': new_checkin.timestamp.isoformat(),
+        'checkin_status': f"{updated_checkin_count}/{location.maxAttendees} checked in"
     }), 200
 
 
@@ -1460,6 +1632,57 @@ def get_chats():
 
     return jsonify(chat_history)
 
+
+def trigger_matchmaking_for_location(location_id):
+    """
+    Trigger automatic matchmaking for all checked-in users at a specific location.
+    This is called when all slots are filled or check-in period ends.
+    """
+    try:
+        # Get all users who checked in to this location
+        checkins = CheckIn.query.filter_by(location_id=location_id).all()
+        checked_in_user_ids = [checkin.user_id for checkin in checkins]
+        
+        if len(checked_in_user_ids) < 2:
+            print(f"Not enough users checked in for matchmaking at location {location_id}")
+            return
+        
+        # Get location details for matchmaking
+        location = LocationInfo.query.get(location_id)
+        if not location:
+            print(f"Location {location_id} not found")
+            return
+        
+        # Shuffle users for random matching
+        random.shuffle(checked_in_user_ids)
+        
+        # Create matches in pairs
+        for i in range(0, len(checked_in_user_ids), 2):
+            if i + 1 < len(checked_in_user_ids):
+                user1_id = checked_in_user_ids[i]
+                user2_id = checked_in_user_ids[i + 1]
+                
+                # Check if users are compatible (opposite genders)
+                user1_data = UserData.query.filter_by(user_auth_id=user1_id).first()
+                user2_data = UserData.query.filter_by(user_auth_id=user2_id).first()
+                
+                if user1_data and user2_data and user1_data.gender != user2_data.gender:
+                    # Create automatic match
+                    new_match = Match(
+                        user1_id=user1_id,
+                        user2_id=user2_id,
+                        status='active',
+                        visible_after=datetime.utcnow() + timedelta(minutes=20)  # 20 min delay
+                    )
+                    db.session.add(new_match)
+                    print(f"Created automatic match between users {user1_id} and {user2_id}")
+        
+        db.session.commit()
+        print(f"Automatic matchmaking completed for location {location_id}")
+        
+    except Exception as e:
+        print(f"Error in automatic matchmaking: {str(e)}")
+        db.session.rollback()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
